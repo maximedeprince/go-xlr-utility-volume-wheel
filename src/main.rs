@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod autostart;
 mod goxlr;
 mod hook;
 mod tray;
