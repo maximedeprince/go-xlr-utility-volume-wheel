@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::time::sleep;
+use tokio::time::{sleep, MissedTickBehavior};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::hook::VolumeEvent;
@@ -18,14 +18,25 @@ const VOLUME_MAX: i32 = 255;
 const VOLUME_FALLBACK: i32 = 128;
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 
-/// Outgoing WebSocket request envelope.
+/// Maximum send rate per channel: a wheel burst is coalesced into one
+/// SetVolume command per tick, so the motor receives a smooth sequence of
+/// commands instead of being hammered.
+const SEND_INTERVAL: Duration = Duration::from_millis(25);
+
+/// After we send a SetVolume on a channel, the daemon echoes a Patch back
+/// with the same value. While the motor is moving, several echoes can also
+/// arrive in flight. Within this window any inbound patch on the channel is
+/// considered our own echo (or a transient reading) and ignored — otherwise
+/// it would clobber the local cache and make the next wheel event compute
+/// from a stale value, causing the fader to visibly bounce backwards.
+const COMMAND_GRACE: Duration = Duration::from_millis(500);
+
 #[derive(Serialize)]
 struct DaemonRequest {
     id: u64,
     data: Value,
 }
 
-/// Incoming WebSocket response envelope.
 #[derive(Deserialize)]
 struct DaemonResponse {
     #[allow(dead_code)]
@@ -39,11 +50,9 @@ pub async fn run_client(
 ) {
     loop {
         if connect_and_run(&mut rx, &active_channel).await.is_err() {
-            // No console in windows_subsystem = "windows"; just retry.
             sleep(RECONNECT_DELAY).await;
             continue;
         }
-        // Channel closed cleanly: exit.
         return;
     }
 }
@@ -57,7 +66,6 @@ async fn connect_and_run(
 
     let mut next_id: u64 = 1;
 
-    // 1. Pull the full status to learn the mixer serial and current volumes.
     send_request(
         &mut write,
         &DaemonRequest {
@@ -70,35 +78,60 @@ async fn connect_and_run(
 
     let (serial, mut volumes) = wait_for_status(&mut read).await?;
 
-    // 2. React to hook events and to incoming status patches.
+    let mut pending: HashMap<String, i32> = HashMap::new();
+    let mut last_command_at: HashMap<String, Instant> = HashMap::new();
+
+    let mut ticker = tokio::time::interval(SEND_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             event = rx.recv() => {
                 let Some(event) = event else { return Ok(()); };
                 let channel = active_channel.read().unwrap().clone();
-                let current = *volumes.get(&channel).unwrap_or(&VOLUME_FALLBACK);
+                // Read pending first so a burst stacks on its own intent
+                // instead of resetting back to the cached value each tick.
+                let current = pending
+                    .get(&channel)
+                    .copied()
+                    .unwrap_or_else(|| volumes.get(&channel).copied().unwrap_or(VOLUME_FALLBACK));
                 let new_volume = match event {
                     VolumeEvent::Up => (current + VOLUME_STEP).min(VOLUME_MAX),
                     VolumeEvent::Down => (current - VOLUME_STEP).max(VOLUME_MIN),
                 };
                 if new_volume != current {
-                    volumes.insert(channel.clone(), new_volume);
+                    pending.insert(channel, new_volume);
+                }
+            }
+            _ = ticker.tick() => {
+                if pending.is_empty() {
+                    continue;
+                }
+                let to_send: Vec<(String, i32)> = pending.drain().collect();
+                let now = Instant::now();
+                for (channel, value) in to_send {
+                    let cached = volumes.get(&channel).copied().unwrap_or(VOLUME_FALLBACK);
+                    if value == cached {
+                        continue;
+                    }
                     send_request(
                         &mut write,
                         &DaemonRequest {
                             id: next_id,
                             data: json!({
-                                "Command": [&serial, {"SetVolume": [&channel, new_volume]}]
+                                "Command": [&serial, {"SetVolume": [&channel, value]}]
                             }),
                         },
                     )
                     .await?;
                     next_id += 1;
+                    volumes.insert(channel.clone(), value);
+                    last_command_at.insert(channel, now);
                 }
             }
             msg = read.next() => {
                 let Some(msg) = msg else { return Err("websocket closed".into()); };
-                handle_incoming(msg?, &serial, &mut volumes)?;
+                handle_incoming(msg?, &serial, &mut volumes, &last_command_at)?;
             }
         }
     }
@@ -154,13 +187,13 @@ fn handle_incoming(
     msg: Message,
     serial: &str,
     volumes: &mut HashMap<String, i32>,
+    last_command_at: &HashMap<String, Instant>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Message::Text(text) = msg else {
         return Ok(());
     };
     let response: DaemonResponse = serde_json::from_str(&text)?;
 
-    // Patch paths look like: /mixers/<serial>/levels/volumes/<Channel>
     let Some(patches) = response.data.get("Patch").and_then(|p| p.as_array()) else {
         return Ok(());
     };
@@ -169,6 +202,12 @@ fn handle_incoming(
     for patch in patches {
         let path = patch.get("path").and_then(|p| p.as_str()).unwrap_or("");
         if let Some(channel) = path.strip_prefix(&prefix) {
+            // Suppress echoes / in-flight intermediates of our own commands.
+            if let Some(at) = last_command_at.get(channel) {
+                if at.elapsed() < COMMAND_GRACE {
+                    continue;
+                }
+            }
             if let Some(value) = patch.get("value").and_then(|v| v.as_i64()) {
                 volumes.insert(
                     channel.to_string(),

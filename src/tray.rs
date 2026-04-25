@@ -44,6 +44,17 @@ pub fn run(active_channel: Arc<RwLock<String>>) {
 
     menu.append(&PredefinedMenuItem::separator())
         .expect("append separator");
+    let autostart_item = CheckMenuItem::new(
+        "Start with Windows",
+        true,
+        crate::autostart::is_enabled(),
+        None,
+    );
+    menu.append(&autostart_item).expect("append autostart");
+    let autostart_id = autostart_item.id().clone();
+
+    menu.append(&PredefinedMenuItem::separator())
+        .expect("append separator");
     let quit = MenuItem::new("Quit", true, None);
     menu.append(&quit).expect("append quit");
     let quit_id = quit.id().clone();
@@ -67,6 +78,19 @@ pub fn run(active_channel: Arc<RwLock<String>>) {
             while let Ok(event) = menu_rx.try_recv() {
                 if event.id == quit_id {
                     std::process::exit(0);
+                }
+                if event.id == autostart_id {
+                    let want = autostart_item.is_checked();
+                    let result = if want {
+                        crate::autostart::enable()
+                    } else {
+                        crate::autostart::disable()
+                    };
+                    if result.is_err() {
+                        // Roll back the visual toggle if the registry call failed.
+                        autostart_item.set_checked(!want);
+                    }
+                    continue;
                 }
                 if let Some(&name) = by_id.get(&event.id) {
                     *active_channel.write().unwrap() = name.to_string();
