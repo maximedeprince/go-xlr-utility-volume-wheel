@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (no leading v, e.g. 0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  release:
+    name: build & publish
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          VERSION="${{ inputs.version }}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+].+)?$ ]]; then
+            echo "::error::version must match semver (X.Y.Z), got: $VERSION"
+            exit 1
+          fi
+          if git rev-parse --verify --quiet "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::tag v$VERSION already exists"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Bump Cargo.toml version
+        shell: bash
+        run: |
+          VERSION="${{ inputs.version }}"
+          # Replace only the first `version = "..."` (the [package] one,
+          # before any [dependencies] section).
+          sed -i "0,/^version = /{s/^version = .*/version = \"$VERSION\"/}" Cargo.toml
+          grep -n '^version = ' Cargo.toml | head -1
+          # Refresh the lockfile entry for this crate without touching deps.
+          cargo update -p go-xlr-utility-volume-button
+
+      - name: Build release executable
+        run: cargo build --release --locked
+
+      - name: Stage release assets
+        shell: bash
+        run: |
+          VERSION="${{ inputs.version }}"
+          mkdir -p dist
+          BIN="go-xlr-utility-volume-button-v${VERSION}-windows-x64.exe"
+          cp target/release/go-xlr-utility-volume-button.exe "dist/${BIN}"
+          (cd dist && sha256sum "${BIN}" > "${BIN}.sha256")
+          ls -l dist
+
+      - name: Commit version bump and tag
+        shell: bash
+        run: |
+          VERSION="${{ inputs.version }}"
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- Cargo.toml Cargo.lock; then
+            echo "version $VERSION already current — skipping bump commit"
+          else
+            git add Cargo.toml Cargo.lock
+            git commit -m "chore: release v${VERSION}"
+            git push origin "HEAD:${BRANCH}"
+          fi
+          git tag -a "v${VERSION}" -m "Release v${VERSION}"
+          git push origin "v${VERSION}"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: v${{ inputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/go-xlr-utility-volume-button-v${{ inputs.version }}-windows-x64.exe
+            dist/go-xlr-utility-volume-button-v${{ inputs.version }}-windows-x64.exe.sha256

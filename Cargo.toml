@@ -2,7 +2,7 @@
 name = "go-xlr-utility-volume-button"
 version = "0.1.0"
 edition = "2021"
-description = "Intercepts Windows volume keys and forwards them to the GoXLR Utility Game channel via WebSocket"
+description = "Tray companion that forwards Windows volume keys to any GoXLR Utility channel via WebSocket"
 license = "MIT"
 
 [dependencies]
