@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -47,9 +48,14 @@ struct DaemonResponse {
 pub async fn run_client(
     mut rx: UnboundedReceiver<VolumeEvent>,
     active_channel: Arc<RwLock<String>>,
+    connected: Arc<AtomicBool>,
 ) {
     loop {
-        if connect_and_run(&mut rx, &active_channel).await.is_err() {
+        if connect_and_run(&mut rx, &active_channel, &connected)
+            .await
+            .is_err()
+        {
+            connected.store(false, Ordering::Release);
             sleep(RECONNECT_DELAY).await;
             continue;
         }
@@ -60,6 +66,7 @@ pub async fn run_client(
 async fn connect_and_run(
     rx: &mut UnboundedReceiver<VolumeEvent>,
     active_channel: &Arc<RwLock<String>>,
+    connected: &Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (ws_stream, _) = connect_async(WS_URL).await?;
     let (mut write, mut read) = ws_stream.split();
@@ -77,6 +84,7 @@ async fn connect_and_run(
     next_id += 1;
 
     let (serial, mut volumes) = wait_for_status(&mut read).await?;
+    connected.store(true, Ordering::Release);
 
     let mut pending: HashMap<String, i32> = HashMap::new();
     let mut last_command_at: HashMap<String, Instant> = HashMap::new();

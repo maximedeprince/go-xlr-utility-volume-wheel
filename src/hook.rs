@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -12,14 +12,14 @@ use windows::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+    GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_VOLUME_DOWN, VK_VOLUME_UP};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    RegisterClassExW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HWND_MESSAGE,
-    KBDLLHOOKSTRUCT, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
-    REGISTER_NOTIFICATION_FLAGS, WH_KEYBOARD_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_KEYDOWN,
+    PostThreadMessageW, RegisterClassExW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+    HWND_MESSAGE, KBDLLHOOKSTRUCT, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
+    REGISTER_NOTIFICATION_FLAGS, WH_KEYBOARD_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_KEYDOWN,
     WM_KEYUP, WM_POWERBROADCAST, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WTSSESSION_CHANGE, WNDCLASSEXW,
 };
 
@@ -36,6 +36,27 @@ static SENDER: OnceLock<UnboundedSender<VolumeEvent>> = OnceLock::new();
 /// console connect). The message pump observes it after each dispatch and
 /// reinstalls the hook on the same thread.
 static REHOOK_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Hook thread id, captured once `run_hook` starts. Used by `request_rehook`
+/// to wake the hook thread from any other thread.
+static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Posted to the hook thread to ask for a re-installation. Win32 reserves
+/// `WM_APP..0xBFFF` for app-defined messages on a per-thread basis.
+const WM_REQUEST_REHOOK: u32 = WM_APP + 1;
+
+/// Tray menu trigger: posts WM_REQUEST_REHOOK to the hook thread so the
+/// next pump iteration tears down and reinstalls the keyboard hook on the
+/// thread that owns it.
+pub fn request_rehook() {
+    let tid = HOOK_THREAD_ID.load(Ordering::Acquire);
+    if tid == 0 {
+        return;
+    }
+    unsafe {
+        let _ = PostThreadMessageW(tid, WM_REQUEST_REHOOK, WPARAM(0), LPARAM(0));
+    }
+}
 
 /// Win32 wParam values for WM_WTSSESSION_CHANGE that mean "the input
 /// desktop has changed under us, the hook may have been detached".
@@ -108,6 +129,8 @@ pub fn run_hook(sender: UnboundedSender<VolumeEvent>) {
     let _ = SENDER.set(sender);
 
     unsafe {
+        HOOK_THREAD_ID.store(GetCurrentThreadId(), Ordering::Release);
+
         // LowLevelHooksTimeout (~300 ms by default on Win10/11) is per-call,
         // not an average — a single late return drops the hook silently. Our
         // proc is tiny but the OS scheduler can delay this thread under load
@@ -165,6 +188,9 @@ pub fn run_hook(sender: UnboundedSender<VolumeEvent>) {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
+            if msg.message == WM_REQUEST_REHOOK {
+                REHOOK_REQUESTED.store(true, Ordering::Release);
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
 

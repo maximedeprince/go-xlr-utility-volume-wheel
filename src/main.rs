@@ -5,6 +5,7 @@ mod goxlr;
 mod hook;
 mod tray;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::mpsc;
@@ -13,6 +14,7 @@ const DEFAULT_CHANNEL: &str = "Game";
 
 fn main() {
     let active_channel = Arc::new(RwLock::new(DEFAULT_CHANNEL.to_string()));
+    let connected = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::unbounded_channel::<hook::VolumeEvent>();
 
     // Low-level keyboard hook — owns its own Win32 message pump.
@@ -26,6 +28,7 @@ fn main() {
     // GoXLR WebSocket client — dedicated single-threaded tokio runtime.
     {
         let active_channel = active_channel.clone();
+        let connected = connected.clone();
         std::thread::Builder::new()
             .name("goxlr-client".into())
             .spawn(move || {
@@ -33,11 +36,11 @@ fn main() {
                     .enable_all()
                     .build()
                     .expect("tokio runtime");
-                rt.block_on(goxlr::run_client(rx, active_channel));
+                rt.block_on(goxlr::run_client(rx, active_channel, connected));
             })
             .expect("spawn goxlr thread");
     }
 
     // Tray icon must run on the process main thread on Windows.
-    tray::run(active_channel);
+    tray::run(active_channel, connected);
 }
