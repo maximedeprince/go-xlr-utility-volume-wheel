@@ -1,6 +1,6 @@
 [package]
 name = "go-xlr-utility-volume-button"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Tray companion that forwards Windows volume keys to any GoXLR Utility channel via WebSocket"
 license = "MIT"
