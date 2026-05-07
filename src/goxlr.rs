@@ -51,15 +51,17 @@ pub async fn run_client(
     connected: Arc<AtomicBool>,
 ) {
     loop {
-        if connect_and_run(&mut rx, &active_channel, &connected)
-            .await
-            .is_err()
-        {
-            connected.store(false, Ordering::Release);
-            sleep(RECONNECT_DELAY).await;
-            continue;
+        match connect_and_run(&mut rx, &active_channel, &connected).await {
+            Ok(()) => return,
+            Err(err) => {
+                if connected.swap(false, Ordering::AcqRel) {
+                    crate::log::error(&format!("WebSocket dropped: {}", err));
+                } else {
+                    crate::log::error(&format!("WebSocket connect failed: {}", err));
+                }
+                sleep(RECONNECT_DELAY).await;
+            }
         }
-        return;
     }
 }
 
@@ -85,6 +87,7 @@ async fn connect_and_run(
 
     let (serial, mut volumes) = wait_for_status(&mut read).await?;
     connected.store(true, Ordering::Release);
+    crate::log::info(&format!("connected to mixer {}", serial));
 
     let mut pending: HashMap<String, i32> = HashMap::new();
     let mut last_command_at: HashMap<String, Instant> = HashMap::new();
@@ -96,7 +99,10 @@ async fn connect_and_run(
         tokio::select! {
             event = rx.recv() => {
                 let Some(event) = event else { return Ok(()); };
-                let channel = active_channel.read().unwrap().clone();
+                let channel = active_channel
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 // Read pending first so a burst stacks on its own intent
                 // instead of resetting back to the cached value each tick.
                 let current = pending

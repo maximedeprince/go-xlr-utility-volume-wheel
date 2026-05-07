@@ -41,7 +41,10 @@ pub fn run(active_channel: Arc<RwLock<String>>, connected: Arc<AtomicBool>) {
     menu.append(&PredefinedMenuItem::separator())
         .expect("append separator");
 
-    let initial = active_channel.read().unwrap().clone();
+    let initial = active_channel
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let mut by_id: HashMap<MenuId, &'static str> = HashMap::new();
     let mut items: HashMap<&'static str, CheckMenuItem> = HashMap::new();
 
@@ -59,6 +62,9 @@ pub fn run(active_channel: Arc<RwLock<String>>, connected: Arc<AtomicBool>) {
     let reinstall_item = MenuItem::new("Reinstall keyboard hook", true, None);
     menu.append(&reinstall_item).expect("append reinstall");
     let reinstall_id = reinstall_item.id().clone();
+    let log_item = MenuItem::new("Open log folder", true, None);
+    menu.append(&log_item).expect("append log");
+    let log_id = log_item.id().clone();
 
     menu.append(&PredefinedMenuItem::separator())
         .expect("append separator");
@@ -121,7 +127,10 @@ pub fn run(active_channel: Arc<RwLock<String>>, connected: Arc<AtomicBool>) {
             if msg.message == WM_TIMER && msg.wParam.0 == STATUS_TIMER_ID {
                 let now = connected.load(Ordering::Acquire);
                 if last_connected != Some(now) {
-                    let channel = active_channel.read().unwrap().clone();
+                    let channel = active_channel
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
                     apply_status(now, &channel);
                     last_connected = Some(now);
                 }
@@ -133,6 +142,16 @@ pub fn run(active_channel: Arc<RwLock<String>>, connected: Arc<AtomicBool>) {
                 }
                 if event.id == reinstall_id {
                     crate::hook::request_rehook();
+                    continue;
+                }
+                if event.id == log_id {
+                    if let Some(path) = crate::log::log_path() {
+                        if let Some(parent) = path.parent() {
+                            let _ = std::process::Command::new("explorer.exe")
+                                .arg(parent)
+                                .spawn();
+                        }
+                    }
                     continue;
                 }
                 if event.id == autostart_id {
@@ -149,7 +168,7 @@ pub fn run(active_channel: Arc<RwLock<String>>, connected: Arc<AtomicBool>) {
                     continue;
                 }
                 if let Some(&name) = by_id.get(&event.id) {
-                    *active_channel.write().unwrap() = name.to_string();
+                    *active_channel.write().unwrap_or_else(|e| e.into_inner()) = name.to_string();
                     for (other, item) in &items {
                         item.set_checked(*other == name);
                     }

@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use tokio::sync::mpsc::UnboundedSender;
 use windows::core::w;
@@ -30,6 +30,12 @@ pub enum VolumeEvent {
 }
 
 static SENDER: OnceLock<UnboundedSender<VolumeEvent>> = OnceLock::new();
+
+/// Daemon connection state, read by the hook proc to decide whether to
+/// swallow the event. While disconnected we hand the volume keys back to
+/// Windows so the user retains a working master volume control instead of
+/// being left with seemingly broken keys.
+static CONNECTED: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 /// Set by the notification window proc when the OS hits a state that may
 /// have invalidated our hook (resume from suspend, session unlock, RDP /
@@ -79,6 +85,16 @@ unsafe extern "system" fn keyboard_hook_proc(
         let vk = kb.vkCode as u16;
 
         if vk == VK_VOLUME_UP.0 || vk == VK_VOLUME_DOWN.0 {
+            // While the daemon is unreachable, leave the keys to Windows so
+            // the user keeps a usable master volume instead of dead keys.
+            let live = CONNECTED
+                .get()
+                .map(|c| c.load(Ordering::Acquire))
+                .unwrap_or(false);
+            if !live {
+                return CallNextHookEx(None, n_code, w_param, l_param);
+            }
+
             if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
                 if let Some(tx) = SENDER.get() {
                     let event = if vk == VK_VOLUME_UP.0 {
@@ -125,8 +141,9 @@ unsafe extern "system" fn notify_wndproc(
     DefWindowProcW(hwnd, msg, w_param, l_param)
 }
 
-pub fn run_hook(sender: UnboundedSender<VolumeEvent>) {
+pub fn run_hook(sender: UnboundedSender<VolumeEvent>, connected: Arc<AtomicBool>) {
     let _ = SENDER.set(sender);
+    let _ = CONNECTED.set(connected);
 
     unsafe {
         HOOK_THREAD_ID.store(GetCurrentThreadId(), Ordering::Release);
