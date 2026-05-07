@@ -15,12 +15,17 @@ use windows::Win32::System::Threading::{
     GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_VOLUME_DOWN, VK_VOLUME_UP};
+use windows::Win32::UI::Input::{
+    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
+    RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEHID,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     PostThreadMessageW, RegisterClassExW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
     HWND_MESSAGE, KBDLLHOOKSTRUCT, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
-    REGISTER_NOTIFICATION_FLAGS, WH_KEYBOARD_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_KEYDOWN,
-    WM_KEYUP, WM_POWERBROADCAST, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WTSSESSION_CHANGE, WNDCLASSEXW,
+    REGISTER_NOTIFICATION_FLAGS, WH_KEYBOARD_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT,
+    WM_KEYDOWN, WM_KEYUP, WM_POWERBROADCAST, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WTSSESSION_CHANGE,
+    WNDCLASSEXW,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -74,6 +79,17 @@ const WTS_SESSION_UNLOCK: u32 = 0x8;
 
 const DEVICE_NOTIFY_WINDOW_HANDLE: REGISTER_NOTIFICATION_FLAGS = REGISTER_NOTIFICATION_FLAGS(0);
 
+/// HID Usage Page 0x0C, Usage 0x01 = Consumer Control top-level. Wireless
+/// headsets (Logitech G Pro X 2 confirmed) route their volume wheel through
+/// vendor software that calls IAudioEndpointVolume directly and never emits
+/// VK_VOLUME_UP / VK_VOLUME_DOWN, bypassing WH_KEYBOARD_LL. Subscribing to
+/// raw HID on this usage lets us see the wheel ticks before they get
+/// translated into endpoint-level changes. We can't swallow them — WM_INPUT
+/// is informational only — so the OSD still flashes, but the GoXLR fader
+/// follows along.
+const HID_USAGE_PAGE_CONSUMER: u16 = 0x0C;
+const HID_USAGE_CONSUMER_CONTROL: u16 = 0x01;
+
 unsafe extern "system" fn keyboard_hook_proc(
     n_code: i32,
     w_param: WPARAM,
@@ -124,21 +140,96 @@ unsafe extern "system" fn notify_wndproc(
     w_param: WPARAM,
     l_param: LPARAM,
 ) -> LRESULT {
-    let needs_rehook = match msg {
-        WM_POWERBROADCAST => matches!(
-            w_param.0 as u32,
-            PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND
-        ),
-        WM_WTSSESSION_CHANGE => matches!(
-            w_param.0 as u32,
-            WTS_SESSION_UNLOCK | WTS_REMOTE_CONNECT | WTS_CONSOLE_CONNECT
-        ),
-        _ => false,
-    };
-    if needs_rehook {
-        REHOOK_REQUESTED.store(true, Ordering::Release);
+    match msg {
+        WM_INPUT => {
+            handle_raw_input(HRAWINPUT(l_param.0 as *mut _));
+        }
+        WM_POWERBROADCAST => {
+            if matches!(
+                w_param.0 as u32,
+                PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND
+            ) {
+                REHOOK_REQUESTED.store(true, Ordering::Release);
+            }
+        }
+        WM_WTSSESSION_CHANGE => {
+            if matches!(
+                w_param.0 as u32,
+                WTS_SESSION_UNLOCK | WTS_REMOTE_CONNECT | WTS_CONSOLE_CONNECT
+            ) {
+                REHOOK_REQUESTED.store(true, Ordering::Release);
+            }
+        }
+        _ => {}
     }
     DefWindowProcW(hwnd, msg, w_param, l_param)
+}
+
+/// Parses a WM_INPUT packet for HID Consumer Control usage and emits a
+/// VolumeEvent when the payload matches the Logitech G-series report
+/// layout: byte 0 is the report id (0x02), byte 1 is the action — 0x01
+/// = volume up, 0x02 = volume down, 0x00 = release (ignored). The same
+/// byte 0 is used by every Logitech audio device tested so far. Other
+/// vendors with different report IDs land here too but their second byte
+/// will not match 0x01 / 0x02 in this convention, so they are silently
+/// dropped — no false positives, just no effect.
+unsafe fn handle_raw_input(handle: HRAWINPUT) {
+    let header_size = std::mem::size_of::<RAWINPUTHEADER>() as u32;
+    let mut size: u32 = 0;
+    // Don't compare against sizeof::<RAWINPUT>() — that's the Rust struct
+    // sized to the largest union variant (RAWMOUSE, ~48 B). A real HID
+    // packet ships at ~36 B, perfectly valid, and would be rejected. The
+    // wire size returned here is the source of truth for what's available.
+    if GetRawInputData(handle, RID_INPUT, None, &mut size, header_size) == u32::MAX || size == 0 {
+        return;
+    }
+
+    let mut buffer = vec![0u8; size as usize];
+    let read = GetRawInputData(
+        handle,
+        RID_INPUT,
+        Some(buffer.as_mut_ptr() as *mut _),
+        &mut size,
+        header_size,
+    );
+    if read != size {
+        return;
+    }
+
+    let raw = &*(buffer.as_ptr() as *const RAWINPUT);
+    if raw.header.dwType != RIM_TYPEHID.0 {
+        return;
+    }
+
+    let hid = &raw.data.hid;
+    let payload_size = hid.dwSizeHid as usize;
+    let payload_count = hid.dwCount as usize;
+    if payload_size < 2 || payload_count == 0 {
+        return;
+    }
+
+    let data_ptr = hid.bRawData.as_ptr();
+    let total = payload_size * payload_count;
+    let buffer_end = buffer.as_ptr().add(buffer.len());
+    if data_ptr.add(total) > buffer_end {
+        return;
+    }
+
+    let bytes = std::slice::from_raw_parts(data_ptr, total);
+    let Some(tx) = SENDER.get() else { return };
+
+    for i in 0..payload_count {
+        let payload = &bytes[i * payload_size..(i + 1) * payload_size];
+        if payload[0] != 0x02 {
+            continue;
+        }
+        let event = match payload[1] {
+            0x01 => VolumeEvent::Up,
+            0x02 => VolumeEvent::Down,
+            _ => continue, // 0x00 release, anything else
+        };
+        let _ = tx.send(event);
+    }
 }
 
 pub fn run_hook(sender: UnboundedSender<VolumeEvent>, connected: Arc<AtomicBool>) {
@@ -199,6 +290,22 @@ pub fn run_hook(sender: UnboundedSender<VolumeEvent>, connected: Arc<AtomicBool>
         .is_ok()
         .then_some(HPOWERNOTIFY(pwr_raw as isize));
         let _ = WTSRegisterSessionNotification(notify_hwnd, NOTIFY_FOR_THIS_SESSION);
+
+        // Subscribe to raw HID Consumer Control input. RIDEV_INPUTSINK
+        // delivers WM_INPUT regardless of which window has focus, which is
+        // what we need for a tray-only app. Failure is non-fatal: the
+        // keyboard hook still works for devices that emit VK codes.
+        let rid = [RAWINPUTDEVICE {
+            usUsagePage: HID_USAGE_PAGE_CONSUMER,
+            usUsage: HID_USAGE_CONSUMER_CONTROL,
+            dwFlags: RIDEV_INPUTSINK,
+            hwndTarget: notify_hwnd,
+        }];
+        if let Err(err) =
+            RegisterRawInputDevices(&rid, std::mem::size_of::<RAWINPUTDEVICE>() as u32)
+        {
+            crate::log::error(&format!("RegisterRawInputDevices failed: {}", err));
+        }
 
         let mut hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), hmodule, 0)
             .expect("SetWindowsHookExW failed");
