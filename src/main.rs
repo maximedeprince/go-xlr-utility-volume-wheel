@@ -4,6 +4,7 @@ mod autostart;
 mod goxlr;
 mod hook;
 mod log;
+mod osd;
 mod tray;
 
 use std::sync::atomic::AtomicBool;
@@ -15,6 +16,7 @@ const DEFAULT_CHANNEL: &str = "Game";
 
 fn main() {
     log::init();
+    osd::start();
 
     let active_channel = Arc::new(RwLock::new(DEFAULT_CHANNEL.to_string()));
     let connected = Arc::new(AtomicBool::new(false));

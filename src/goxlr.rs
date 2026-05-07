@@ -140,7 +140,8 @@ async fn connect_and_run(
                     .await?;
                     next_id += 1;
                     volumes.insert(channel.clone(), value);
-                    last_command_at.insert(channel, now);
+                    last_command_at.insert(channel.clone(), now);
+                    crate::osd::show(&channel, value, VOLUME_MAX);
                 }
             }
             msg = read.next() => {
