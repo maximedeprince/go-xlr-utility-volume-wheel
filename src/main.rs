@@ -1,24 +1,32 @@
 #![windows_subsystem = "windows"]
 
 mod autostart;
+mod config;
 mod goxlr;
 mod hook;
 mod log;
 mod osd;
+mod settings;
 mod tray;
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::mpsc;
 
-const DEFAULT_CHANNEL: &str = "Game";
-
 fn main() {
     log::init();
+    let cfg = Arc::new(RwLock::new(config::load()));
     osd::start();
 
-    let active_channel = Arc::new(RwLock::new(DEFAULT_CHANNEL.to_string()));
+    // Active channel is shared with goxlr / tray / settings as the
+    // canonical ALL_CHANNELS index. AtomicUsize keeps the hot read path
+    // (per volume event in goxlr.rs) lock-free.
+    let initial_idx = cfg
+        .read()
+        .map(|c| config::channel_index(&c.default_channel))
+        .unwrap_or(0);
+    let active_channel = Arc::new(AtomicUsize::new(initial_idx));
     let connected = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::unbounded_channel::<hook::VolumeEvent>();
 
@@ -49,6 +57,8 @@ fn main() {
             .expect("spawn goxlr thread");
     }
 
-    // Tray icon must run on the process main thread on Windows.
-    tray::run(active_channel, connected);
+    // Tray icon must run on the process main thread on Windows. Also
+    // owns the cycle-channel hotkey since WM_HOTKEY is delivered to the
+    // thread that called RegisterHotKey.
+    tray::run(active_channel, connected, cfg);
 }

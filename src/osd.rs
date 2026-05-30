@@ -3,21 +3,22 @@ use std::sync::{Mutex, OnceLock};
 
 use windows::core::w;
 use windows::Win32::Foundation::{
-    BOOL, COLORREF, HMODULE, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM,
+    BOOL, COLORREF, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, DrawTextW,
-    EndPaint, FillRect, InvalidateRect, SelectObject, SetBkMode, SetTextColor, SetWindowRgn,
-    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DT_LEFT, DT_RIGHT, DT_SINGLELINE,
-    DT_VCENTER, FW_SEMIBOLD, OUT_OUTLINE_PRECIS, PAINTSTRUCT, TRANSPARENT,
+    EndPaint, FillRect, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, SelectObject, SetBkMode,
+    SetTextColor, SetWindowRgn, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DT_LEFT,
+    DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FW_SEMIBOLD, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    OUT_OUTLINE_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, EnumWindows, GetClassNameW, GetMessageW,
-    GetSystemMetrics, GetWindowLongW, GetWindowRect, KillTimer, PostThreadMessageW,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, EnumWindows, GetClassNameW, GetCursorPos,
+    GetMessageW, GetSystemMetrics, GetWindowLongW, GetWindowRect, KillTimer, PostThreadMessageW,
     RegisterClassExW, SetLayeredWindowAttributes, SetTimer, SetWindowLongW, SetWindowPos,
     ShowWindow, TranslateMessage, EVENT_OBJECT_SHOW, GWL_EXSTYLE, LWA_ALPHA, MSG, OBJID_WINDOW,
     SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNA,
@@ -49,11 +50,20 @@ const SUPPRESS_TIMER_ID: usize = 2;
 const SUPPRESS_TIMER_MS: u32 = 1000;
 const WM_OSD_UPDATE: u32 = WM_APP + 10;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OsdMode {
+    /// Channel name + progress bar + percentage.
+    Volume,
+    /// Centered "→ ChannelName" for the cycle-hotkey popup.
+    Switch,
+}
+
 #[derive(Clone)]
 struct OsdState {
     channel: String,
     value: i32,
     max: i32,
+    mode: OsdMode,
 }
 
 static STATE: OnceLock<Mutex<OsdState>> = OnceLock::new();
@@ -66,6 +76,7 @@ pub fn start() {
         channel: String::new(),
         value: 0,
         max: 255,
+        mode: OsdMode::Volume,
     }));
     std::thread::Builder::new()
         .name("osd".into())
@@ -76,14 +87,31 @@ pub fn start() {
 /// Updates the OSD state and pokes its thread to redraw + reset the
 /// auto-hide timer. Safe to call from any thread, never blocks.
 pub fn show(channel: &str, value: i32, max: i32) {
-    let Some(state) = STATE.get() else {
-        return;
-    };
-    if let Ok(mut s) = state.lock() {
+    update_and_kick(|s| {
         s.channel.clear();
         s.channel.push_str(channel);
         s.value = value;
         s.max = max;
+        s.mode = OsdMode::Volume;
+    });
+}
+
+/// Briefly displays the channel name with no bar — the visual hint that
+/// accompanies the cycle hotkey when the user switches the active fader.
+pub fn show_channel_switch(channel: &str) {
+    update_and_kick(|s| {
+        s.channel.clear();
+        s.channel.push_str(channel);
+        s.mode = OsdMode::Switch;
+    });
+}
+
+fn update_and_kick(mutate: impl FnOnce(&mut OsdState)) {
+    let Some(state) = STATE.get() else {
+        return;
+    };
+    if let Ok(mut s) = state.lock() {
+        mutate(&mut s);
     }
     let tid = OSD_THREAD_ID.load(Ordering::Acquire);
     if tid != 0 {
@@ -169,6 +197,18 @@ fn thread_main() {
                 // most likely to lazily create or unhide its OSD, so we
                 // catch it just before our own window paints over it.
                 let _ = EnumWindows(Some(enum_yeet_proc), LPARAM(0));
+                // Re-center on the current monitor in case the user moved
+                // their active display since the last show.
+                let (x, y) = position();
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND::default(),
+                    x,
+                    y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+                );
                 let _ = ShowWindow(hwnd, SW_SHOWNA);
                 let _ = InvalidateRect(hwnd, None, true);
                 SetTimer(hwnd, HIDE_TIMER_ID, HIDE_TIMER_MS, None);
@@ -180,18 +220,45 @@ fn thread_main() {
     }
 }
 
+/// Center of the OSD on the monitor the cursor is on right now. Lets
+/// the OSD follow the user across displays — important for multi-screen
+/// rigs that switch a single active display at a time (KVM, DisplayFusion,
+/// DisplayMagician profiles), where `GetSystemMetrics(SM_CXSCREEN)` only
+/// ever returns the primary monitor and would strand the OSD off-screen.
 fn position() -> (i32, i32) {
     unsafe {
-        let screen_w = GetSystemMetrics(SM_CXSCREEN);
-        let screen_h = GetSystemMetrics(SM_CYSCREEN);
-        let x = (screen_w - OSD_WIDTH) / 2;
-        // Win11 puts the volume OSD at bottom-center; Win10 at top-center.
-        // Mirror that so our window lands directly over Windows's and the
-        // user sees only ours.
-        let y = if is_win11() {
-            screen_h - OSD_HEIGHT - 80
+        let mut cursor = POINT::default();
+        let monitor_rect = if GetCursorPos(&mut cursor).is_ok() {
+            let hmon = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+                Some(mi.rcWork)
+            } else {
+                None
+            }
         } else {
-            72
+            None
+        };
+        let (left, top, right, bottom) = match monitor_rect {
+            Some(r) => (r.left, r.top, r.right, r.bottom),
+            None => (
+                0,
+                0,
+                GetSystemMetrics(SM_CXSCREEN),
+                GetSystemMetrics(SM_CYSCREEN),
+            ),
+        };
+        let x = left + (right - left - OSD_WIDTH) / 2;
+        // Win11 puts the volume OSD at bottom-center of the work area;
+        // Win10 at top-center. Mirror that so our window lands directly
+        // over Windows's and the user sees only ours.
+        let y = if is_win11() {
+            bottom - OSD_HEIGHT - 80
+        } else {
+            top + 72
         };
         (x, y)
     }
@@ -403,6 +470,17 @@ unsafe fn paint(hwnd: HWND) {
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, COLORREF(COLOR_TEXT));
 
+    match s.mode {
+        OsdMode::Volume => paint_volume(hdc, &s),
+        OsdMode::Switch => paint_switch(hdc, &s),
+    }
+
+    SelectObject(hdc, old_font);
+    let _ = DeleteObject(font);
+    let _ = EndPaint(hwnd, &ps);
+}
+
+unsafe fn paint_volume(hdc: windows::Win32::Graphics::Gdi::HDC, s: &OsdState) {
     // Channel name (left).
     let mut name: Vec<u16> = s.channel.encode_utf16().collect();
     let mut name_rect = RECT {
@@ -467,8 +545,40 @@ unsafe fn paint(hwnd: HWND) {
         FillRect(hdc, &fill_rect, fill);
         let _ = DeleteObject(fill);
     }
+}
 
-    SelectObject(hdc, old_font);
-    let _ = DeleteObject(font);
-    let _ = EndPaint(hwnd, &ps);
+unsafe fn paint_switch(hdc: windows::Win32::Graphics::Gdi::HDC, s: &OsdState) {
+    // Simple, recognisable layout: "→ Channel" centered. Uses the OSD's
+    // accent colour for the arrow so the eye registers a channel change
+    // instantly even at peripheral vision.
+    SetTextColor(hdc, COLORREF(COLOR_FILL));
+    let mut arrow: Vec<u16> = "→".encode_utf16().collect();
+    let arrow_w = NUMBER_WIDTH; // re-use the right-padding column width
+    let mut arrow_rect = RECT {
+        left: PADDING,
+        top: 0,
+        right: PADDING + arrow_w,
+        bottom: OSD_HEIGHT,
+    };
+    DrawTextW(
+        hdc,
+        &mut arrow,
+        &mut arrow_rect,
+        DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
+    );
+
+    SetTextColor(hdc, COLORREF(COLOR_TEXT));
+    let mut name: Vec<u16> = s.channel.encode_utf16().collect();
+    let mut name_rect = RECT {
+        left: PADDING + arrow_w + 12,
+        top: 0,
+        right: OSD_WIDTH - PADDING,
+        bottom: OSD_HEIGHT,
+    };
+    DrawTextW(
+        hdc,
+        &mut name,
+        &mut name_rect,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+    );
 }

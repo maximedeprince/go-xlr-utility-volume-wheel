@@ -33,8 +33,15 @@ This app gives you a **secondary fader you can summon from anywhere**, mapped to
 ## Features
 
 - **Volume keys → GoXLR fader.** Up/Down adjust the active GoXLR channel by 5 (out of 0–255), with the Windows OSD suppressed and the system master volume left alone.
-- **Tray menu.** Pick the active channel from the full 11-channel list at any time.
-- **Auto-start with Windows.** One-click toggle in the tray menu — uses the user `Run` registry key, no admin needed.
+- **Headset wheel support.** Wireless headsets (Logitech G Pro X 2 and friends) that route their wheel through vendor software bypassing the keyboard pipeline are picked up via raw HID Consumer Control.
+- **GoXLR-styled OSD.** Replaces the Windows volume pop-up with a horizontal pill showing the channel name, an orange progress bar and the percentage. Auto-positions on the monitor under the cursor — works across KVMs and DisplayMagician profiles.
+- **Settings window.** Left-click the tray icon to open a dark, custom-painted panel:
+  - **Click a channel name** to control it *now*. The active channel is highlighted with an accent stripe + bold text.
+  - **Tap the ★** to pick the **startup channel** — the one the app reopens with the next time Windows boots. Independent from the active selection.
+  - **Tap the eye icon** to show or hide a channel. Hidden channels stay out of the tray menu and the cycle hotkey rotation.
+- **Cycle hotkey.** A global keyboard shortcut (default `Ctrl+Shift+Alt+V`) jumps the active channel to the next visible one. Re-recordable from the settings window — applied live, no restart.
+- **Right-click tray menu.** Quick switcher showing only the visible channels with a check-mark on the active one.
+- **Auto-start with Windows.** Toggle in the settings window — uses the user `Run` registry key, no admin needed.
 - **Smooth motor moves.** Wheel bursts are coalesced and rate-limited (one command every 25 ms) so the physical fader glides instead of jittering.
 - **Echo-aware.** Ignores the daemon's own patch echoes for 500 ms after a command, so back-to-back wheel ticks compute against the right value.
 - **Auto-reconnect.** Survives the [GoXLR Utility](https://github.com/GoXLR-on-Linux/goxlr-utility) daemon restarting.
@@ -59,17 +66,28 @@ This app gives you a **secondary fader you can summon from anywhere**, mapped to
 
 ## Usage
 
-Once running, an orange speaker icon appears in the tray. Right-click it to:
+Once running, an orange speaker icon appears in the tray.
 
-- Pick which GoXLR channel the volume keys control (a checkmark shows the active one).
-- Toggle **Start with Windows**.
-- **Quit**.
+- **Left-click** the tray icon to open the Settings window.
+- **Right-click** for the quick channel switcher — only the channels you've marked visible appear here, with a check-mark on the active one. Picking one makes it the active channel for the rest of the session; it does not change the startup channel.
+- **Volume up/down** on your keyboard or headset moves the fader on the active channel. The Windows OSD never appears; the system master volume is untouched.
+- **Cycle hotkey** (default `Ctrl+Shift+Alt+V`) advances the active channel to the next visible one without leaving the keyboard.
+
+Inside the Settings window each channel row has three independent controls:
+
+| Control | What it does |
+| --- | --- |
+| Channel name | Click to **make this channel active** (the one the volume keys move *now*). Transient — not persisted. |
+| ★ Star | **Startup channel** marker. The channel the app picks up next time Windows boots. Click ★ to set; persisted to `config.json`. |
+| 👁 Eye | **Visibility**. Hidden channels disappear from the tray right-click menu and the cycle hotkey rotation. Hiding the startup channel auto-promotes the next visible one. |
+
+A `?` button opens a built-in help screen (EN / FR).
 
 <p align="center">
-  <img src="docs/tray-menu.png" alt="Tray menu showing the 11 selectable GoXLR channels with Game checked, plus Start with Windows and Quit" width="280">
+  <img src="docs/tray-menu.png" alt="Tray menu showing the visible GoXLR channels with Game checked, plus Settings and Quit" width="280">
 </p>
 
-That's it. Press your keyboard's volume up/down — the fader on the chosen channel moves and the Windows OSD stays out of the way.
+That's it. Press your keyboard's volume up/down — the fader on the active channel moves and the Windows OSD stays out of the way.
 
 ## How it works
 

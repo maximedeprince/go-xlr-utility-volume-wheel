@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -47,7 +47,7 @@ struct DaemonResponse {
 
 pub async fn run_client(
     mut rx: UnboundedReceiver<VolumeEvent>,
-    active_channel: Arc<RwLock<String>>,
+    active_channel: Arc<AtomicUsize>,
     connected: Arc<AtomicBool>,
 ) {
     loop {
@@ -67,7 +67,7 @@ pub async fn run_client(
 
 async fn connect_and_run(
     rx: &mut UnboundedReceiver<VolumeEvent>,
-    active_channel: &Arc<RwLock<String>>,
+    active_channel: &Arc<AtomicUsize>,
     connected: &Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (ws_stream, _) = connect_async(WS_URL).await?;
@@ -99,10 +99,12 @@ async fn connect_and_run(
         tokio::select! {
             event = rx.recv() => {
                 let Some(event) = event else { return Ok(()); };
-                let channel = active_channel
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
+                // One lock-free atomic load + a constant-array index, no
+                // RwLock contention on the hot path.
+                let channel = crate::config::channel_name(
+                    active_channel.load(Ordering::Acquire),
+                )
+                .to_string();
                 // Read pending first so a burst stacks on its own intent
                 // instead of resetting back to the cached value each tick.
                 let current = pending
